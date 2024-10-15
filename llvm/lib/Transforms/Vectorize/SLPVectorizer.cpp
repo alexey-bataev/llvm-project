@@ -291,6 +291,8 @@ getFloorFullVectorNumberOfElements(const TargetTransformInfo &TTI, Type *Ty,
   if (NumParts == 0 || NumParts >= Sz)
     return bit_floor(Sz);
   unsigned RegVF = bit_ceil(divideCeil(Sz, NumParts));
+  if (RegVF > Sz)
+    return bit_floor(Sz);
   return (Sz / RegVF) * RegVF;
 }
 
@@ -9344,7 +9346,8 @@ void BoUpSLP::transformNodes() {
       // insertvector instructions.
       unsigned StartIdx = 0;
       unsigned End = VL.size();
-      for (unsigned VF = VL.size() / 2; VF >= MinVF; VF = bit_ceil(VF) / 2) {
+      for (unsigned VF = bit_ceil(VL.size() / 2); VF >= MinVF;
+           VF = bit_ceil(VF) / 2) {
         SmallVector<unsigned> Slices;
         for (unsigned Cnt = StartIdx; Cnt + VF <= End; Cnt += VF) {
           ArrayRef<Value *> Slice = VL.slice(Cnt, VF);
@@ -9375,7 +9378,9 @@ void BoUpSLP::transformNodes() {
             if (IsSplat)
               continue;
             InstructionsState S = getSameOpcode(Slice, *TLI);
-            if (!S.getOpcode() || S.isAltShuffle() || !allSameBlock(Slice))
+            if (!S.getOpcode() || S.isAltShuffle() || !allSameBlock(Slice) ||
+                (S.getOpcode() == Instruction::Load &&
+                 areKnownNonVectorizableLoads(Slice)))
               continue;
             if (VF == 2) {
               // Try to vectorize reduced values or if all users are vectorized.
@@ -9395,8 +9400,10 @@ void BoUpSLP::transformNodes() {
                     canVectorizeLoads(Slice, Slice.front(), Order, PointerOps);
                 // Do not vectorize gathers.
                 if (Res == LoadsState::ScatterVectorize ||
-                    Res == LoadsState::Gather)
+                    Res == LoadsState::Gather) {
+                  registerNonVectorizableLoads(Slice);
                   continue;
+                }
               } else if (S.getOpcode() == Instruction::ExtractElement ||
                          (TTI->getInstructionCost(
                               cast<Instruction>(Slice.front()), CostKind) <
@@ -19071,7 +19078,8 @@ public:
 
       unsigned ReduxWidth = NumReducedVals;
       if (!VectorizeNonPowerOf2 || !has_single_bit(ReduxWidth + 1))
-        ReduxWidth = bit_floor(ReduxWidth);
+        ReduxWidth = getFloorFullVectorNumberOfElements(
+            *TTI, Candidates.front()->getType(), ReduxWidth);
       ReduxWidth = std::min(ReduxWidth, MaxElts);
 
       unsigned Start = 0;
@@ -19079,10 +19087,7 @@ public:
       // Restarts vectorization attempt with lower vector factor.
       unsigned PrevReduxWidth = ReduxWidth;
       bool CheckForReusedReductionOpsLocal = false;
-      auto &&AdjustReducedVals = [&Pos, &Start, &ReduxWidth, NumReducedVals,
-                                  &CheckForReusedReductionOpsLocal,
-                                  &PrevReduxWidth, &V,
-                                  &IgnoreList](bool IgnoreVL = false) {
+      auto AdjustReducedVals = [&](bool IgnoreVL = false) {
         bool IsAnyRedOpGathered = !IgnoreVL && V.isAnyGathered(IgnoreList);
         if (!CheckForReusedReductionOpsLocal && PrevReduxWidth == ReduxWidth) {
           // Check if any of the reduction ops are gathered. If so, worth
@@ -19093,7 +19098,10 @@ public:
         if (Pos < NumReducedVals - ReduxWidth + 1)
           return IsAnyRedOpGathered;
         Pos = Start;
-        ReduxWidth = bit_ceil(ReduxWidth) / 2;
+        --ReduxWidth;
+        if (ReduxWidth > 1)
+          ReduxWidth = getFloorFullVectorNumberOfElements(
+              *TTI, Candidates.front()->getType(), ReduxWidth);
         return IsAnyRedOpGathered;
       };
       bool AnyVectorized = false;
@@ -19325,7 +19333,10 @@ public:
         }
         Pos += ReduxWidth;
         Start = Pos;
-        ReduxWidth = llvm::bit_floor(NumReducedVals - Pos);
+        ReduxWidth = NumReducedVals - Pos;
+        if (ReduxWidth > 1)
+          ReduxWidth = getFloorFullVectorNumberOfElements(
+              *TTI, Candidates.front()->getType(), NumReducedVals - Pos);
         AnyVectorized = true;
       }
       if (OptReusedScalars && !AnyVectorized) {
