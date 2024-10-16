@@ -291,6 +291,8 @@ getFloorFullVectorNumberOfElements(const TargetTransformInfo &TTI, Type *Ty,
   if (NumParts == 0 || NumParts >= Sz)
     return bit_floor(Sz);
   unsigned RegVF = bit_ceil(divideCeil(Sz, NumParts));
+  if (RegVF > Sz)
+    return bit_floor(Sz);
   return (Sz / RegVF) * RegVF;
 }
 
@@ -1504,6 +1506,12 @@ public:
   /// \returns True if the VectorizableTree is both tiny and not fully
   /// vectorizable. We do not vectorize such trees.
   bool isTreeTinyAndNotFullyVectorizable(bool ForReduction = false) const;
+
+  /// Checks if the graph and all its subgraphs cannot be better vectorized.
+  /// It may happen, if all gather nodes are loads and they cannot be
+  /// "clusterized". In this case even subgraphs cannot be vectorized more
+  /// effectively than the base graph.
+  bool isTreeNotExtendable() const;
 
   /// Assume that a legal-sized 'or'-reduction of shifted/zexted loaded values
   /// can be load combined in the backend. Load combining may not be allowed in
@@ -9344,7 +9352,8 @@ void BoUpSLP::transformNodes() {
       // insertvector instructions.
       unsigned StartIdx = 0;
       unsigned End = VL.size();
-      for (unsigned VF = VL.size() / 2; VF >= MinVF; VF = bit_ceil(VF) / 2) {
+      for (unsigned VF = bit_ceil(VL.size() / 2); VF >= MinVF;
+           VF = bit_ceil(VF) / 2) {
         SmallVector<unsigned> Slices;
         for (unsigned Cnt = StartIdx; Cnt + VF <= End; Cnt += VF) {
           ArrayRef<Value *> Slice = VL.slice(Cnt, VF);
@@ -9375,7 +9384,9 @@ void BoUpSLP::transformNodes() {
             if (IsSplat)
               continue;
             InstructionsState S = getSameOpcode(Slice, *TLI);
-            if (!S.getOpcode() || S.isAltShuffle() || !allSameBlock(Slice))
+            if (!S.getOpcode() || S.isAltShuffle() || !allSameBlock(Slice) ||
+                (S.getOpcode() == Instruction::Load &&
+                 areKnownNonVectorizableLoads(Slice)))
               continue;
             if (VF == 2) {
               // Try to vectorize reduced values or if all users are vectorized.
@@ -9395,8 +9406,16 @@ void BoUpSLP::transformNodes() {
                     canVectorizeLoads(Slice, Slice.front(), Order, PointerOps);
                 // Do not vectorize gathers.
                 if (Res == LoadsState::ScatterVectorize ||
-                    Res == LoadsState::Gather)
+                    Res == LoadsState::Gather) {
+                  if (Res == LoadsState::Gather) {
+                    registerNonVectorizableLoads(Slice);
+                    // If reductions and the scalars from the root node are
+                    // analyzed - mark as non-vectorizable reduction.
+                    if (UserIgnoreList && E.Idx == 0)
+                      analyzedReductionVals(Slice);
+                  }
                   continue;
+                }
               } else if (S.getOpcode() == Instruction::ExtractElement ||
                          (TTI->getInstructionCost(
                               cast<Instruction>(Slice.front()), CostKind) <
@@ -9442,6 +9461,8 @@ void BoUpSLP::transformNodes() {
               VectorizableTree[PrevSize]->getOpcode() !=
                   Instruction::ExtractElement &&
               !isSplat(Slice)) {
+            if (UserIgnoreList && E.Idx == 0)
+              analyzedReductionVals(Slice);
             VectorizableTree.pop_back();
             assert(PrevEntriesSize == LoadEntriesToVectorize.size() &&
                    "LoadEntriesToVectorize expected to remain the same");
@@ -11513,6 +11534,21 @@ bool BoUpSLP::isTreeTinyAndNotFullyVectorizable(bool ForReduction) const {
   // Otherwise, we can't vectorize the tree. It is both tiny and not fully
   // vectorizable.
   return true;
+}
+
+bool BoUpSLP::isTreeNotExtendable() const {
+  if (getCanonicalGraphSize() != getTreeSize())
+    return false;
+  bool Res = false;
+  for (unsigned Idx : seq<unsigned>(BaseGraphSize)) {
+    TreeEntry &E = *VectorizableTree[Idx];
+    if (!E.isGather())
+      continue;
+    if (E.getOpcode() != Instruction::Load)
+      return false;
+    Res = true;
+  }
+  return Res;
 }
 
 InstructionCost BoUpSLP::getSpillCost() const {
@@ -19071,7 +19107,8 @@ public:
 
       unsigned ReduxWidth = NumReducedVals;
       if (!VectorizeNonPowerOf2 || !has_single_bit(ReduxWidth + 1))
-        ReduxWidth = bit_floor(ReduxWidth);
+        ReduxWidth = getFloorFullVectorNumberOfElements(
+            *TTI, Candidates.front()->getType(), ReduxWidth);
       ReduxWidth = std::min(ReduxWidth, MaxElts);
 
       unsigned Start = 0;
@@ -19079,10 +19116,7 @@ public:
       // Restarts vectorization attempt with lower vector factor.
       unsigned PrevReduxWidth = ReduxWidth;
       bool CheckForReusedReductionOpsLocal = false;
-      auto &&AdjustReducedVals = [&Pos, &Start, &ReduxWidth, NumReducedVals,
-                                  &CheckForReusedReductionOpsLocal,
-                                  &PrevReduxWidth, &V,
-                                  &IgnoreList](bool IgnoreVL = false) {
+      auto AdjustReducedVals = [&](bool IgnoreVL = false) {
         bool IsAnyRedOpGathered = !IgnoreVL && V.isAnyGathered(IgnoreList);
         if (!CheckForReusedReductionOpsLocal && PrevReduxWidth == ReduxWidth) {
           // Check if any of the reduction ops are gathered. If so, worth
@@ -19093,7 +19127,10 @@ public:
         if (Pos < NumReducedVals - ReduxWidth + 1)
           return IsAnyRedOpGathered;
         Pos = Start;
-        ReduxWidth = bit_ceil(ReduxWidth) / 2;
+        --ReduxWidth;
+        if (ReduxWidth > 1)
+          ReduxWidth = getFloorFullVectorNumberOfElements(
+              *TTI, Candidates.front()->getType(), ReduxWidth);
         return IsAnyRedOpGathered;
       };
       bool AnyVectorized = false;
@@ -19109,7 +19146,12 @@ public:
         PrevReduxWidth = ReduxWidth;
         ArrayRef<Value *> VL(std::next(Candidates.begin(), Pos), ReduxWidth);
         // Beeing analyzed already - skip.
-        if (V.areAnalyzedReductionVals(VL)) {
+        if (V.areAnalyzedReductionVals(VL) ||
+            (!has_single_bit(ReduxWidth) &&
+             (V.areAnalyzedReductionVals(
+                  VL.take_front(bit_floor(ReduxWidth))) ||
+              V.areAnalyzedReductionVals(
+                  VL.take_back(bit_floor(ReduxWidth)))))) {
           (void)AdjustReducedVals(/*IgnoreVL=*/true);
           continue;
         }
@@ -19215,8 +19257,17 @@ public:
                    << " and threshold "
                    << ore::NV("Threshold", -SLPCostThreshold);
           });
-          if (!AdjustReducedVals())
+          if (V.isTreeNotExtendable()) {
+            Pos += ReduxWidth;
+            Start = Pos;
+            ReduxWidth = NumReducedVals - Pos;
+            if (ReduxWidth > 1)
+              ReduxWidth = getFloorFullVectorNumberOfElements(
+                  *TTI, Candidates.front()->getType(), NumReducedVals - Pos);
             V.analyzedReductionVals(VL);
+          } else if (!AdjustReducedVals()) {
+            V.analyzedReductionVals(VL);
+          }
           continue;
         }
 
@@ -19325,7 +19376,10 @@ public:
         }
         Pos += ReduxWidth;
         Start = Pos;
-        ReduxWidth = llvm::bit_floor(NumReducedVals - Pos);
+        ReduxWidth = NumReducedVals - Pos;
+        if (ReduxWidth > 1)
+          ReduxWidth = getFloorFullVectorNumberOfElements(
+              *TTI, Candidates.front()->getType(), NumReducedVals - Pos);
         AnyVectorized = true;
       }
       if (OptReusedScalars && !AnyVectorized) {
