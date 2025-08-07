@@ -2,7 +2,7 @@
 ; RUN: opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu -mcpu=cascadelake < %s | FileCheck %s
 
 define void @test(ptr %0, i32 %add651) {
-; CHECK-LABEL: define void @test(
+; CHECK-LABEL: define void @test(xxx
 ; CHECK-SAME: ptr [[TMP0:%.*]], i32 [[ADD651:%.*]]) #[[ATTR0:[0-9]+]] {
 ; CHECK-NEXT:  [[ENTRY:.*:]]
 ; CHECK-NEXT:    [[PREDPEL11:%.*]] = alloca [0 x [0 x [25 x i32]]], i32 0, align 16
@@ -19,14 +19,14 @@ define void @test(ptr %0, i32 %add651) {
 ; CHECK-NEXT:    [[ARRAYIDX660:%.*]] = getelementptr i8, ptr [[TMP4]], i64 7800
 ; CHECK-NEXT:    [[ARRAYIDX689:%.*]] = getelementptr i8, ptr [[TMP4]], i64 7816
 ; CHECK-NEXT:    [[TMP6:%.*]] = add <2 x i32> [[TMP3]], splat (i32 1)
-; CHECK-NEXT:    [[TMP8:%.*]] = add <2 x i32> [[TMP6]], [[TMP7]]
-; CHECK-NEXT:    [[TMP9:%.*]] = insertelement <2 x i32> <i32 1, i32 poison>, i32 [[TMP5]], i32 1
-; CHECK-NEXT:    [[TMP10:%.*]] = add <2 x i32> [[TMP8]], [[TMP9]]
+; CHECK-NEXT:    [[TMP10:%.*]] = add <2 x i32> [[TMP6]], [[TMP7]]
 ; CHECK-NEXT:    [[TMP11:%.*]] = insertelement <4 x i32> poison, i32 [[ADD651]], i32 0
 ; CHECK-NEXT:    [[TMP13:%.*]] = insertelement <4 x i32> [[TMP11]], i32 [[TMP2]], i32 1
 ; CHECK-NEXT:    [[TMP19:%.*]] = shufflevector <2 x i32> [[TMP10]], <2 x i32> poison, <4 x i32> <i32 0, i32 1, i32 poison, i32 poison>
 ; CHECK-NEXT:    [[TMP14:%.*]] = shufflevector <4 x i32> [[TMP13]], <4 x i32> [[TMP19]], <4 x i32> <i32 0, i32 1, i32 4, i32 5>
-; CHECK-NEXT:    [[TMP15:%.*]] = lshr <4 x i32> [[TMP14]], splat (i32 1)
+; CHECK-NEXT:    [[TMP20:%.*]] = insertelement <4 x i32> <i32 0, i32 0, i32 1, i32 poison>, i32 [[TMP5]], i32 3
+; CHECK-NEXT:    [[TMP21:%.*]] = add <4 x i32> [[TMP14]], [[TMP20]]
+; CHECK-NEXT:    [[TMP15:%.*]] = lshr <4 x i32> [[TMP21]], splat (i32 1)
 ; CHECK-NEXT:    [[SHR685:%.*]] = lshr i32 [[TMP2]], 1
 ; CHECK-NEXT:    [[TMP16:%.*]] = trunc <4 x i32> [[TMP15]] to <4 x i16>
 ; CHECK-NEXT:    [[CONV686:%.*]] = trunc i32 [[SHR685]] to i16
