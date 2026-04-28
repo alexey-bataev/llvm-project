@@ -17702,6 +17702,43 @@ bool BoUpSLP::isTreeTinyAndNotFullyVectorizable(bool ForReduction) const {
          })))))
     return true;
 
+  // If the tree contains only phis, buildvectors, split nodes and
+  // small nodes with reuses, we can skip it.
+  const TreeEntry *VectorNode = nullptr;
+  NumGathers = 0;
+  if (!ForReduction && SLPCostThreshold >= 0 &&
+      VectorizableTree.size() > LimitTreeSize &&
+      all_of(VectorizableTree,
+             [&](const std::unique_ptr<TreeEntry> &TE) {
+               if (!TE->isGather() && TE->hasState() &&
+                   TE->State != TreeEntry::SplitVectorize &&
+                   TE->getOpcode() != Instruction::PHI) {
+                 if (VectorNode)
+                   return false;
+                 VectorNode = TE.get();
+                 return true;
+               }
+               if (TE->isGather())
+                 ++NumGathers;
+               return TE->State == TreeEntry::SplitVectorize ||
+                      (TE->Idx == 0 && TE->Scalars.size() == 2 &&
+                       TE->hasState() && TE->getOpcode() == Instruction::ICmp &&
+                       VectorizableTree.size() > LimitTreeSize) ||
+                      (TE->isGather() &&
+                       none_of(TE->Scalars, IsaPred<ExtractElementInst>)) ||
+                      (TE->hasState() &&
+                       (TE->getOpcode() == Instruction::PHI ||
+                        (TE->hasCopyableElements() &&
+                         static_cast<unsigned>(count_if(
+                             TE->Scalars, IsaPred<PHINode, Constant>)) >=
+                             TE->Scalars.size() / 2) ||
+                        ((!TE->ReuseShuffleIndices.empty() ||
+                          !TE->ReorderIndices.empty() || TE->isAltShuffle()) &&
+                         TE->Scalars.size() == 2)));
+             }) &&
+      (!VectorNode || VectorNode->getOpcode() == Instruction::GetElementPtr))
+    return true;
+
   // If the tree contains only buildvector, 2 non-buildvectors (with root user
   // tree node) and other buildvectors, we can skip it.
   if (!ForReduction && SLPCostThreshold.getNumOccurrences() &&
