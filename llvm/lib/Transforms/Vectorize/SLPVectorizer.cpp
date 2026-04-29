@@ -8597,98 +8597,123 @@ bool BoUpSLP::isProfitableToReorder() const {
   constexpr unsigned GatherLoadsLimit = 2;
   if (VectorizableTree.size() <= TinyTree)
     return true;
-  if (VectorizableTree.front()->hasState() &&
-      !VectorizableTree.front()->isGather() &&
-      (VectorizableTree.front()->getOpcode() == Instruction::Store ||
-       VectorizableTree.front()->getOpcode() == Instruction::PHI ||
-       (VectorizableTree.front()->getVectorFactor() <= TinyVF &&
-        (VectorizableTree.front()->getOpcode() == Instruction::PtrToInt ||
-         VectorizableTree.front()->getOpcode() == Instruction::ICmp))) &&
-      VectorizableTree.front()->ReorderIndices.empty()) {
-    // Check if the tree has only single store and single (unordered) load node,
-    // other nodes are phis or geps/binops, combined with phis, and/or single
-    // gather load node
-    if (VectorizableTree.front()->hasState() &&
-        VectorizableTree.front()->getOpcode() == Instruction::PHI &&
-        VectorizableTree.front()->Scalars.size() == TinyVF &&
-        VectorizableTree.front()->getNumOperands() > PhiOpsLimit)
-      return false;
-    // Single node, which require reorder - skip.
-    if (VectorizableTree.front()->hasState() &&
-        VectorizableTree.front()->getOpcode() == Instruction::Store &&
-        VectorizableTree.front()->ReorderIndices.empty()) {
-      const unsigned ReorderedSplitsCnt =
-          count_if(VectorizableTree, [&](const std::unique_ptr<TreeEntry> &TE) {
-            return TE->State == TreeEntry::SplitVectorize &&
-                   !TE->ReorderIndices.empty() && TE->UserTreeIndex.UserTE &&
-                   TE->UserTreeIndex.UserTE->State == TreeEntry::Vectorize &&
-                   ::isCommutative(TE->UserTreeIndex.UserTE->getMainOp());
-          });
-      if (ReorderedSplitsCnt <= 1 &&
-          static_cast<unsigned>(count_if(
-              VectorizableTree, [&](const std::unique_ptr<TreeEntry> &TE) {
-                return ((!TE->isGather() &&
-                         (TE->ReorderIndices.empty() ||
-                          (TE->UserTreeIndex.UserTE &&
-                           TE->UserTreeIndex.UserTE->State ==
-                               TreeEntry::Vectorize &&
-                           !TE->UserTreeIndex.UserTE->ReuseShuffleIndices
-                                .empty()))) ||
-                        (TE->isGather() && TE->ReorderIndices.empty() &&
-                         (!TE->hasState() || TE->isAltShuffle() ||
-                          TE->getOpcode() == Instruction::Load ||
-                          TE->getOpcode() == Instruction::ZExt ||
-                          TE->getOpcode() == Instruction::SExt))) &&
-                       (VectorizableTree.front()->getVectorFactor() > TinyVF ||
-                        !TE->isGather() || none_of(TE->Scalars, [&](Value *V) {
-                          return !isConstant(V) && isVectorized(V);
-                        }));
-              })) >= VectorizableTree.size() - ReorderedSplitsCnt)
-        return false;
-    }
-    bool HasPhis = false;
-    bool HasLoad = true;
-    unsigned GatherLoads = 0;
-    for (const std::unique_ptr<TreeEntry> &TE :
-         ArrayRef(VectorizableTree).drop_front()) {
-      if (TE->State == TreeEntry::SplitVectorize)
-        continue;
-      if (!TE->hasState()) {
-        if (all_of(TE->Scalars, IsaPred<Constant, PHINode>) ||
-            all_of(TE->Scalars, IsaPred<BinaryOperator, PHINode>))
-          continue;
-        if (VectorizableTree.front()->Scalars.size() == TinyVF &&
-            any_of(TE->Scalars, IsaPred<PHINode, GEPOperator>))
-          continue;
-        return true;
+
+  // The outer guard from the original code requires the root entry to have a
+  // valid state, be vectorized (not a gather), have no reorder indices, and
+  // use one of a small set of opcodes. If any of these fails, fall through to
+  // the conservative "true" result.
+  const TreeEntry &Front = *VectorizableTree.front();
+  if (!Front.hasState() || Front.isGather() || !Front.ReorderIndices.empty())
+    return true;
+
+  const unsigned FrontOpcode = Front.getOpcode();
+  const unsigned FrontVF = Front.getVectorFactor();
+  const unsigned FrontScalarsSize = Front.Scalars.size();
+  const bool IsStore = FrontOpcode == Instruction::Store;
+  const bool IsPhi = FrontOpcode == Instruction::PHI;
+  if (!IsStore && !IsPhi &&
+      !(FrontVF <= TinyVF && (FrontOpcode == Instruction::PtrToInt ||
+                              FrontOpcode == Instruction::ICmp)))
+    return true;
+
+  // Check if the tree has only single store and single (unordered) load node,
+  // other nodes are phis or geps/binops, combined with phis, and/or single
+  // gather load node
+  if (IsPhi && FrontScalarsSize == TinyVF &&
+      Front.getNumOperands() > PhiOpsLimit)
+    return false;
+  // Single node, which require reorder - skip.
+  if (IsStore) {
+    // Stop counting once the budget of 1 is exceeded; the exact value beyond
+    // that does not affect the final decision.
+    unsigned ReorderedSplitsCnt = 0;
+    for (const std::unique_ptr<TreeEntry> &TE : VectorizableTree) {
+      if (TE->State == TreeEntry::SplitVectorize &&
+          !TE->ReorderIndices.empty() && TE->UserTreeIndex.UserTE &&
+          TE->UserTreeIndex.UserTE->State == TreeEntry::Vectorize &&
+          ::isCommutative(TE->UserTreeIndex.UserTE->getMainOp())) {
+        if (++ReorderedSplitsCnt > 1)
+          break;
       }
-      if (TE->getOpcode() == Instruction::Load && TE->ReorderIndices.empty()) {
-        if (!TE->isGather()) {
-          HasLoad = false;
-          continue;
+    }
+    if (ReorderedSplitsCnt <= 1) {
+      // Equivalent to checking that the count of matched entries is at least
+      // VectorizableTree.size() - ReorderedSplitsCnt, i.e. the count of
+      // non-matched entries is at most ReorderedSplitsCnt. Bail out as soon as
+      // that bound is exceeded.
+      unsigned NonMatchedCnt = 0;
+      for (const std::unique_ptr<TreeEntry> &TE : VectorizableTree) {
+        const bool IsGather = TE->isGather();
+        const bool ReorderEmpty = TE->ReorderIndices.empty();
+        bool IsMatched;
+        if (IsGather) {
+          IsMatched = ReorderEmpty;
+          if (IsMatched && TE->hasState() && !TE->isAltShuffle()) {
+            const unsigned Op = TE->getOpcode();
+            IsMatched = Op == Instruction::Load ||
+                        Op == Instruction::ZExt || Op == Instruction::SExt;
+          }
+        } else {
+          IsMatched =
+              ReorderEmpty || (TE->UserTreeIndex.UserTE &&
+                               TE->UserTreeIndex.UserTE->State ==
+                                   TreeEntry::Vectorize &&
+                               !TE->UserTreeIndex.UserTE->ReuseShuffleIndices
+                                    .empty());
         }
-        if (HasLoad)
-          return true;
-        ++GatherLoads;
-        if (GatherLoads >= GatherLoadsLimit)
-          return true;
+        if (IsMatched && IsGather && FrontVF <= TinyVF) {
+          IsMatched = none_of(TE->Scalars, [&](Value *V) {
+            return !isConstant(V) && isVectorized(V);
+          });
+        }
+        if (!IsMatched && ++NonMatchedCnt > ReorderedSplitsCnt)
+          break;
       }
-      if (TE->getOpcode() == Instruction::GetElementPtr ||
-          Instruction::isBinaryOp(TE->getOpcode()))
-        continue;
-      if (TE->getOpcode() != Instruction::PHI &&
-          (!TE->hasCopyableElements() ||
-           static_cast<unsigned>(count_if(TE->Scalars, IsaPred<PHINode>)) <
-               TE->Scalars.size() / 2))
-        return true;
-      if (VectorizableTree.front()->Scalars.size() == TinyVF &&
-          TE->getNumOperands() > PhiOpsLimit)
+      if (NonMatchedCnt <= ReorderedSplitsCnt)
         return false;
-      HasPhis = true;
     }
-    return !HasPhis;
   }
-  return true;
+  bool HasPhis = false;
+  bool HasLoad = true;
+  unsigned GatherLoads = 0;
+  for (const std::unique_ptr<TreeEntry> &TE :
+       ArrayRef(VectorizableTree).drop_front()) {
+    if (TE->State == TreeEntry::SplitVectorize)
+      continue;
+    if (!TE->hasState()) {
+      if (all_of(TE->Scalars, IsaPred<Constant, PHINode>) ||
+          all_of(TE->Scalars, IsaPred<BinaryOperator, PHINode>))
+        continue;
+      if (FrontScalarsSize == TinyVF &&
+          any_of(TE->Scalars, IsaPred<PHINode, GEPOperator>))
+        continue;
+      return true;
+    }
+    const unsigned Opcode = TE->getOpcode();
+    if (Opcode == Instruction::Load && TE->ReorderIndices.empty()) {
+      if (!TE->isGather()) {
+        HasLoad = false;
+        continue;
+      }
+      if (HasLoad)
+        return true;
+      ++GatherLoads;
+      if (GatherLoads >= GatherLoadsLimit)
+        return true;
+    }
+    if (Opcode == Instruction::GetElementPtr ||
+        Instruction::isBinaryOp(Opcode))
+      continue;
+    if (Opcode != Instruction::PHI &&
+        (!TE->hasCopyableElements() ||
+         static_cast<unsigned>(count_if(TE->Scalars, IsaPred<PHINode>)) <
+             TE->Scalars.size() / 2))
+      return true;
+    if (FrontScalarsSize == TinyVF && TE->getNumOperands() > PhiOpsLimit)
+      return false;
+    HasPhis = true;
+  }
+  return !HasPhis;
 }
 
 void BoUpSLP::TreeEntry::reorderSplitNode(unsigned Idx, ArrayRef<int> Mask,
