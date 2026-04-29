@@ -8732,6 +8732,12 @@ void BoUpSLP::reorderTopToBottom() {
   // Maps a TreeEntry to the reorder indices of external users.
   DenseMap<const TreeEntry *, SmallVector<OrdersType, 1>>
       ExternalUserReorderMap;
+  // Bucket all entries by the vector factors they may match. This avoids
+  // scanning the whole VectorizableTree per VF inside the reordering loop
+  // below. Each entry is registered under TE->Scalars.size(), and also under
+  // TE->ReuseShuffleIndices.size() if non-empty and different. Within each
+  // bucket entries follow tree order.
+  SmallDenseMap<unsigned, SmallVector<TreeEntry *>> EntriesByVF;
   // Compute IgnoreReorder once - it depends only on UserIgnoreList and
   // VectorizableTree.front(), which do not change during this loop.
   const bool IgnoreReorder =
@@ -8743,6 +8749,11 @@ void BoUpSLP::reorderTopToBottom() {
   // extracts.
   for_each(VectorizableTree, [&, &TTIRef = *TTI](
                                  const std::unique_ptr<TreeEntry> &TE) {
+    EntriesByVF[TE->Scalars.size()].push_back(TE.get());
+    if (!TE->ReuseShuffleIndices.empty() &&
+        TE->ReuseShuffleIndices.size() != TE->Scalars.size())
+      EntriesByVF[TE->ReuseShuffleIndices.size()].push_back(TE.get());
+
     // Look for external users that will probably be vectorized.
     SmallVector<OrdersType, 1> ExternalUserReorderIndices =
         findExternalStoreUsersReorderIndices(TE.get());
@@ -8805,9 +8816,18 @@ void BoUpSLP::reorderTopToBottom() {
     }
   });
 
+  // Process VFs in decreasing order. Iterating only the present VFs avoids
+  // scanning the dense [2, MaxVF] range for sparse maps.
+  SmallVector<unsigned, 4> SortedVFs;
+  SortedVFs.reserve(VFToOrderedEntries.size());
+  for (const auto &P : VFToOrderedEntries) {
+    if (P.first > 1)
+      SortedVFs.push_back(P.first);
+  }
+  sort(SortedVFs, std::greater<unsigned>());
+
   // Reorder the graph nodes according to their vectorization factor.
-  for (unsigned VF = VectorizableTree.front()->getVectorFactor();
-       !VFToOrderedEntries.empty() && VF > 1; --VF) {
+  for (unsigned VF : SortedVFs) {
     auto It = VFToOrderedEntries.find(VF);
     if (It == VFToOrderedEntries.end())
       continue;
@@ -8815,8 +8835,6 @@ void BoUpSLP::reorderTopToBottom() {
     // used order and reorder scalar elements in the nodes according to this
     // mostly used order.
     ArrayRef<TreeEntry *> OrderedEntries = It->second.getArrayRef();
-    // Delete VF entry upon exit.
-    llvm::scope_exit Cleanup([&]() { VFToOrderedEntries.erase(It); });
 
     // All operands are reordered and used only in this node - propagate the
     // most used order to the user node.
@@ -8929,8 +8947,12 @@ void BoUpSLP::reorderTopToBottom() {
     transform(BestOrder, MaskOrder.begin(), [E](unsigned I) {
       return I < E ? static_cast<int>(I) : PoisonMaskElem;
     });
-    // Do an actual reordering, if profitable.
-    for (std::unique_ptr<TreeEntry> &TE : VectorizableTree) {
+    // Do an actual reordering, if profitable. Iterate only the entries
+    // bucketed for the given VF instead of scanning the whole graph.
+    auto BucketIt = EntriesByVF.find(VF);
+    if (BucketIt == EntriesByVF.end())
+      continue;
+    for (TreeEntry *TE : BucketIt->second) {
       // Just do the reordering for the nodes with the given VF.
       if (TE->Scalars.size() != VF) {
         if (TE->ReuseShuffleIndices.size() == VF) {
