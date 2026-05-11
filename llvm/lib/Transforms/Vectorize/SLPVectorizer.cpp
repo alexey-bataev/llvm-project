@@ -229,14 +229,18 @@ static cl::opt<bool>
                 cl::desc("Display the SLP trees with Graphviz"));
 
 static cl::opt<bool> VectorizeNonPowerOf2(
-    "slp-vectorize-non-power-of-2", cl::init(false), cl::Hidden,
+    "slp-vectorize-non-power-of-2", cl::init(true), cl::Hidden,
     cl::desc("Try to vectorize with non-power-of-2 number of elements."));
 
 /// True when \p slp-vectorize-non-power-of-2 is enabled and \p NumElts is a
-/// supported non-power-of-2 width: \p NumElts + 1 must be a power of two
-/// (e.g. 3 or 7 lanes, i.e. almost a full power-of-2 register).
-static bool isAllowedNonPowerOf2VF(unsigned NumElts) {
-  return VectorizeNonPowerOf2 && has_single_bit(NumElts + 1);
+/// supported non-power-of-2 width. The width is supported if \p NumElts is not
+/// a power of two and either it is small (<= 5, e.g. 3 or 5 lanes), or
+/// \p NumElts - 1 is also not a power of two (e.g. 6, 7, 10..15 lanes), or
+/// the elements being vectorized are themselves vectors (REVEC).
+static bool isAllowedNonPowerOf2VF(unsigned NumElts, bool IsVectorElement) {
+  return VectorizeNonPowerOf2 && !has_single_bit(NumElts) &&
+         ((SLPReVec && IsVectorElement) || NumElts <= 5 ||
+          !has_single_bit(NumElts - 1));
 }
 
 /// Enables vectorization of copyable elements.
@@ -8595,6 +8599,13 @@ bool BoUpSLP::isProfitableToReorder() const {
   constexpr unsigned TinyTree = 10;
   constexpr unsigned PhiOpsLimit = 12;
   constexpr unsigned GatherLoadsLimit = 2;
+  // Do not reorder splat stores.
+  if (VectorizableTree.size() == 2 &&
+      VectorizableTree.front()->State == TreeEntry::Vectorize &&
+      VectorizableTree.front()->getOpcode() == Instruction::Store &&
+      VectorizableTree.back()->Scalars.front() ==
+          VectorizableTree.back()->Scalars.back())
+    return false;
   if (VectorizableTree.size() <= TinyTree)
     return true;
   if (VectorizableTree.front()->hasState() &&
@@ -9939,8 +9950,13 @@ void BoUpSLP::tryToVectorizeGatheredLoads(
     SmallVector<std::pair<ArrayRef<Value *>, LoadsState>> Results;
     unsigned StartIdx = 0;
     SmallVector<int> CandidateVFs;
-    if (isAllowedNonPowerOf2VF(MaxVF))
-      CandidateVFs.push_back(MaxVF);
+    if (isAllowedNonPowerOf2VF(
+            MaxVF, isa<FixedVectorType>(Loads.front()->getType()))) {
+      const unsigned FullVectorNumElements = getFullVectorNumberOfElements(
+          *TTI, Loads.front()->getType(), MaxVF - 1);
+      if (MaxVF >= 3 && FullVectorNumElements != MaxVF - 1)
+        CandidateVFs.push_back(MaxVF);
+    }
     for (int NumElts = getFloorFullVectorNumberOfElements(
              *TTI, Loads.front()->getType(), MaxVF);
          NumElts > 1; NumElts = getFloorFullVectorNumberOfElements(
@@ -19632,6 +19648,7 @@ BoUpSLP::isGatherShuffledSingleRegisterEntry(
   auto *NodeUI = DT->getNode(TEInsertBlock);
   assert(NodeUI && "Should only process reachable instructions");
   SmallPtrSet<Value *, 4> GatheredScalars(llvm::from_range, VL);
+  const BasicBlock *const TEInsertPtBlock = TEInsertPt->getParent();
   auto CheckOrdering = [&](const Instruction *InsertPt) {
     // Argument InsertPt is an instruction where vector code for some other
     // tree entry (one that shares one or more scalars with TE) is going to be
@@ -19653,12 +19670,12 @@ BoUpSLP::isGatherShuffledSingleRegisterEntry(
                (NodeUI->getDFSNumIn() == NodeEUI->getDFSNumIn()) &&
            "Different nodes should have different DFS numbers");
     // Check the order of the gather nodes users.
-    if (TEInsertPt->getParent() != InsertBlock &&
-        (DT->dominates(NodeUI, NodeEUI) || !DT->dominates(NodeEUI, NodeUI)))
+    if (TEInsertPtBlock != InsertBlock) {
+      if (DT->dominates(NodeUI, NodeEUI) || !DT->dominates(NodeEUI, NodeUI))
+        return false;
+    } else if (TEInsertPt->comesBefore(InsertPt)) {
       return false;
-    if (TEInsertPt->getParent() == InsertBlock &&
-        TEInsertPt->comesBefore(InsertPt))
-      return false;
+    }
     return true;
   };
   // Find all tree entries used by the gathered values. If no common entries
@@ -19755,6 +19772,43 @@ BoUpSLP::isGatherShuffledSingleRegisterEntry(
     It->second = Res;
     return Res;
   };
+  // Cache loop-invariant TEUseEI.UserTE properties used by the inner loop -
+  // each is queried per TEPtr but does not depend on TEPtr.
+  const TreeEntry *const TEUserTE = TEUseEI.UserTE;
+  const unsigned TEUseEdgeIdx = TEUseEI.EdgeIdx;
+  const unsigned TEUserIdx = TEUserTE->Idx;
+  const bool TEUserHasState = TEUserTE->hasState();
+  const bool TEUserIsGather = TEUserTE->isGather();
+  const bool TEUserDoesNotNeedToSchedule = TEUserTE->doesNotNeedToSchedule();
+  const bool TEUserHasGatherUser = HasGatherUser(TEUserTE);
+  const bool TEUserIsVectorizePHI =
+      TEUserTE->State == TreeEntry::Vectorize && TEUserHasState &&
+      TEUserTE->getOpcode() == Instruction::PHI;
+  const bool TEIsTransformedToGather = TransformedToGatherNodes.contains(TE);
+  // Cache `is_contained(UserTE->Scalars, TEInsertPt)` per UserTE - TEInsertPt
+  // is loop-invariant and the same UserTE may be encountered for many TEPtr
+  // values, while the per-call check is O(Scalars.size()).
+  SmallDenseMap<const TreeEntry *, bool> ScalarsContainTEInsertPtCache;
+  auto ScalarsContainTEInsertPt = [&](const TreeEntry *UserTE) {
+    auto [It, Inserted] = ScalarsContainTEInsertPtCache.try_emplace(UserTE);
+    if (!Inserted)
+      return It->second;
+    bool Res = is_contained(UserTE->Scalars, TEInsertPt);
+    It->second = Res;
+    return Res;
+  };
+  // Cache CheckOrdering(InsertPt) per InsertPt - DT->getNode/dominates are
+  // not free and the same InsertPt is queried many times across TEPtr values
+  // sharing the same UserTE/insertion point.
+  SmallDenseMap<const Instruction *, bool> CheckOrderingCache;
+  auto CachedCheckOrdering = [&](const Instruction *InsertPt) {
+    auto [It, Inserted] = CheckOrderingCache.try_emplace(InsertPt);
+    if (!Inserted)
+      return It->second;
+    bool Res = CheckOrdering(InsertPt);
+    It->second = Res;
+    return Res;
+  };
   for (Value *V : VL) {
     if (isConstant(V) || !VisitedValue.insert(V).second)
       continue;
@@ -19762,7 +19816,7 @@ BoUpSLP::isGatherShuffledSingleRegisterEntry(
     SmallPtrSet<const TreeEntry *, 4> VToTEs;
     SmallVector<const TreeEntry *> GatherNodes(
         ValueToGatherNodes.lookup(V).takeVector());
-    if (TransformedToGatherNodes.contains(TE)) {
+    if (TEIsTransformedToGather) {
       for (TreeEntry *E : getSplitTreeEntries(V)) {
         if (TE == E || !TransformedToGatherNodes.contains(E) ||
             !E->UserTreeIndex || E->UserTreeIndex.UserTE->isGather())
@@ -19788,22 +19842,24 @@ BoUpSLP::isGatherShuffledSingleRegisterEntry(
                  [&](const auto &P) { return P.first == TE->Idx; }))
         continue;
       const EdgeInfo &UseEI = TEPtr->UserTreeIndex;
+      const TreeEntry *const UseUserTE = UseEI.UserTE;
+      const unsigned UseEdgeIdx = UseEI.EdgeIdx;
 
-      PHINode *UserPHI = (UseEI.UserTE->State != TreeEntry::SplitVectorize &&
-                          UseEI.UserTE->hasState())
-                             ? dyn_cast<PHINode>(UseEI.UserTE->getMainOp())
+      PHINode *UserPHI = (UseUserTE->State != TreeEntry::SplitVectorize &&
+                          UseUserTE->hasState())
+                             ? dyn_cast<PHINode>(UseUserTE->getMainOp())
                              : nullptr;
       Instruction *InsertPt =
-          UserPHI ? UserPHI->getIncomingBlock(UseEI.EdgeIdx)->getTerminator()
-                  : &getLastInstructionInBundle(UseEI.UserTE);
+          UserPHI ? UserPHI->getIncomingBlock(UseEdgeIdx)->getTerminator()
+                  : &getLastInstructionInBundle(UseUserTE);
       if (TEInsertPt == InsertPt) {
         // Check nodes, which might be emitted first.
         if (TEUserNeedsEmitFirst) {
-          if (UseEI.UserTE->State != TreeEntry::Vectorize ||
-              (UseEI.UserTE->hasState() &&
-               UseEI.UserTE->getOpcode() == Instruction::PHI &&
-               !UseEI.UserTE->isAltShuffle()) ||
-              !AllScalarsUsedOutsideBlock(UseEI.UserTE))
+          if (UseUserTE->State != TreeEntry::Vectorize ||
+              (UseUserTE->hasState() &&
+               UseUserTE->getOpcode() == Instruction::PHI &&
+               !UseUserTE->isAltShuffle()) ||
+              !AllScalarsUsedOutsideBlock(UseUserTE))
             continue;
         }
 
@@ -19811,44 +19867,39 @@ BoUpSLP::isGatherShuffledSingleRegisterEntry(
         // exit, no known ordering at this point, available only after real
         // scheduling.
         if (!doesNotNeedToBeScheduled(InsertPt) &&
-            (TEUseEI.UserTE != UseEI.UserTE || TEUseEI.EdgeIdx < UseEI.EdgeIdx))
+            (TEUserTE != UseUserTE || TEUseEdgeIdx < UseEdgeIdx))
           continue;
         // If the users are the PHI nodes with the same incoming blocks - skip.
-        if (TEUseEI.UserTE->State == TreeEntry::Vectorize &&
-            TEUseEI.UserTE->getOpcode() == Instruction::PHI &&
-            UseEI.UserTE->State == TreeEntry::Vectorize &&
-            UseEI.UserTE->getOpcode() == Instruction::PHI &&
-            TEUseEI.UserTE != UseEI.UserTE)
+        if (TEUserIsVectorizePHI && UseUserTE != TEUserTE &&
+            UseUserTE->State == TreeEntry::Vectorize &&
+            UseUserTE->getOpcode() == Instruction::PHI)
           continue;
         // If 2 gathers are operands of the same entry (regardless of whether
         // user is PHI or else), compare operands indices, use the earlier one
         // as the base.
-        if (TEUseEI.UserTE == UseEI.UserTE && TEUseEI.EdgeIdx < UseEI.EdgeIdx)
+        if (TEUserTE == UseUserTE && TEUseEdgeIdx < UseEdgeIdx)
           continue;
         // If the user instruction is used for some reason in different
         // vectorized nodes - make it depend on index.
-        if (TEUseEI.UserTE != UseEI.UserTE &&
-            (TEUseEI.UserTE->Idx < UseEI.UserTE->Idx ||
-             HasGatherUser(TEUseEI.UserTE)))
+        if (TEUserTE != UseUserTE &&
+            (TEUserIdx < UseUserTE->Idx || TEUserHasGatherUser))
           continue;
         // If the user node is the operand of the other user node - skip.
-        if (CheckParentNodes(TEUseEI.UserTE, UseEI.UserTE, UseEI.EdgeIdx))
+        if (CheckParentNodes(TEUserTE, UseUserTE, UseEdgeIdx))
           continue;
       }
 
-      if (!TEUseEI.UserTE->isGather() && !UserPHI &&
-          TEUseEI.UserTE->doesNotNeedToSchedule() !=
-              UseEI.UserTE->doesNotNeedToSchedule() &&
-          is_contained(UseEI.UserTE->Scalars, TEInsertPt))
+      if (!TEUserIsGather && !UserPHI &&
+          TEUserDoesNotNeedToSchedule != UseUserTE->doesNotNeedToSchedule() &&
+          ScalarsContainTEInsertPt(UseUserTE))
         continue;
       // Check if the user node of the TE comes after user node of TEPtr,
       // otherwise TEPtr depends on TE.
       if ((TEInsertBlock != InsertPt->getParent() ||
-           TEUseEI.EdgeIdx < UseEI.EdgeIdx || TEUseEI.UserTE != UseEI.UserTE) &&
-          (!CheckOrdering(InsertPt) ||
-           (UseEI.UserTE->hasCopyableElements() &&
-            IsTEInsertPtUsedOutsideBlock() &&
-            is_contained(UseEI.UserTE->Scalars, TEInsertPt))))
+           TEUseEdgeIdx < UseEdgeIdx || TEUserTE != UseUserTE) &&
+          (!CachedCheckOrdering(InsertPt) ||
+           (UseUserTE->hasCopyableElements() && IsTEInsertPtUsedOutsideBlock() &&
+            ScalarsContainTEInsertPt(UseUserTE))))
         continue;
       // The node is reused - exit.
       if (CheckAndUseSameNode(TEPtr))
@@ -19856,14 +19907,13 @@ BoUpSLP::isGatherShuffledSingleRegisterEntry(
       // The parent node is copyable with last inst used outside? And the last
       // inst is the next inst for the lastinst of TEPtr? Exit, if yes, to
       // preserve def-use chain.
-      if (CheckNonSchedulableOrdering(UseEI.UserTE, InsertPt))
+      if (CheckNonSchedulableOrdering(UseUserTE, InsertPt))
         continue;
       VToTEs.insert(TEPtr);
     }
     if (ArrayRef<TreeEntry *> VTEs = getSplitTreeEntries(V); !VTEs.empty()) {
       const auto *It = find_if(VTEs, [&](const TreeEntry *MTE) {
-        return MTE != TE && MTE != TEUseEI.UserTE &&
-               !DeletedNodes.contains(MTE) &&
+        return MTE != TE && MTE != TEUserTE && !DeletedNodes.contains(MTE) &&
                !TransformedToGatherNodes.contains(MTE);
       });
       if (It != VTEs.end()) {
@@ -19871,7 +19921,8 @@ BoUpSLP::isGatherShuffledSingleRegisterEntry(
         if (none_of(TE->CombinedEntriesWithIndices,
                     [&](const auto &P) { return P.first == VTE->Idx; })) {
           Instruction &LastBundleInst = getLastInstructionInBundle(VTE);
-          if (&LastBundleInst == TEInsertPt || !CheckOrdering(&LastBundleInst))
+          if (&LastBundleInst == TEInsertPt ||
+              !CachedCheckOrdering(&LastBundleInst))
             continue;
         }
         // The node is reused - exit.
@@ -19902,7 +19953,7 @@ BoUpSLP::isGatherShuffledSingleRegisterEntry(
                     [&](const auto &P) { return P.first == VTE->Idx; })) {
           Instruction &LastBundleInst = getLastInstructionInBundle(VTE);
           if (&LastBundleInst == TEInsertPt ||
-              !CheckOrdering(&LastBundleInst) ||
+              !CachedCheckOrdering(&LastBundleInst) ||
               CheckNonSchedulableOrdering(VTE, &LastBundleInst))
             continue;
         }
@@ -26342,7 +26393,7 @@ SLPVectorizerPass::vectorizeStoreChain(ArrayRef<Value *> Chain, BoUpSLP &R,
       VF < 2 || VF < MinVF) {
     // Check if vectorizing with a non-power-of-2 VF should be considered; see
     // isAllowedNonPowerOf2VF for supported widths.
-    if (!VectorizeNonPowerOf2 || (VF < MinVF && VF + 1 != MinVF))
+    if (!VectorizeNonPowerOf2 || VF < MinVF)
       return false;
   }
 
@@ -26358,9 +26409,11 @@ SLPVectorizerPass::vectorizeStoreChain(ArrayRef<Value *> Chain, BoUpSLP &R,
       Analysis.buildInstructionsState(ValOps.getArrayRef(), R);
   if (all_of(ValOps, IsaPred<Instruction>) && ValOps.size() > 1) {
     DenseSet<Value *> Stores(Chain.begin(), Chain.end());
-    bool IsAllowedSize = hasFullVectorsOrPowerOf2(
-                             *TTI, ValOps.front()->getType(), ValOps.size()) ||
-                         isAllowedNonPowerOf2VF(ValOps.size());
+    bool IsAllowedSize =
+        hasFullVectorsOrPowerOf2(*TTI, ValOps.front()->getType(),
+                                 ValOps.size()) ||
+        isAllowedNonPowerOf2VF(ValOps.size(),
+                               isa<FixedVectorType>(ValOps.front()->getType()));
     if ((!IsAllowedSize && S && S.getOpcode() != Instruction::Load &&
          (!S.getMainOp()->isSafeToRemove() ||
           any_of(ValOps.getArrayRef(),
@@ -26643,7 +26696,7 @@ bool StoreChainContext::initializeContext(
   // First try a supported non-power-of-2 VF (see isAllowedNonPowerOf2VF).
   unsigned NonPowerOf2VF = 0;
   unsigned CandVF = std::clamp<unsigned>(Operands.size(), MinVF, MaxVF);
-  if (isAllowedNonPowerOf2VF(CandVF)) {
+  if (isAllowedNonPowerOf2VF(CandVF, isa<FixedVectorType>(StoreTy))) {
     NonPowerOf2VF = CandVF;
     assert(NonPowerOf2VF != MaxVF &&
            "Non-power-of-2 VF should not be equal to MaxVF");
@@ -26659,8 +26712,9 @@ bool StoreChainContext::initializeContext(
     return false;
   }
 
-  for (unsigned VF = std::max(MaxVF, NonPowerOf2VF); VF >= MinVF;
-       VF = divideCeil(VF, 2))
+  if (NonPowerOf2VF > 0)
+    CandidateVFs.push(NonPowerOf2VF);
+  for (unsigned VF = MaxVF; VF >= MinVF; VF = divideCeil(VF, 2))
     CandidateVFs.push(VF);
 
   End = Operands.size();
@@ -28167,6 +28221,8 @@ public:
     // Try merge consecutive reduced values into a single vectorizable group and
     // check, if they can be vectorized as copyables.
     const bool TwoGroupsOnly = ReducedVals.size() == 2;
+    const bool LastOfTwoGroupsIsSingle =
+        TwoGroupsOnly && ReducedVals.back().size() == 1;
     const bool TwoGroupsOfSameSmallSize =
         TwoGroupsOnly &&
         ReducedVals.front().size() == ReducedVals.back().size() &&
@@ -28386,8 +28442,46 @@ public:
           ReduxWidth = bit_floor(ReduxWidth);
         return ReduxWidth;
       };
-      if (!isAllowedNonPowerOf2VF(ReduxWidth))
-        ReduxWidth = GetVectorFactor(ReduxWidth);
+      const unsigned FullRegReduxWidth = GetVectorFactor(ReduxWidth);
+      bool AllowNoPowerOf2 = false;
+      if (isAllowedNonPowerOf2VF(
+              ReduxWidth,
+              isa<FixedVectorType>(Candidates.front()->getType()))) {
+        // For a 5-wide reduction merged from two groups (4 elements plus a
+        // single trailing value) via copyable analysis, refuse the non-power
+        // of-2 width when the lone trailing value does not fit the main-op
+        // operand pattern. Such a mismatch makes a 5-wide vector wasteful
+        // compared to a 4-wide + scalar tail.
+        const unsigned SmallReductionNonPowerOf2 = 5;
+        auto LoneValueMismatchesMainOpOperands = [&]() {
+          Value *LastVal = ReducedVals.back().back();
+          if (!isa<Instruction>(LastVal))
+            return any_of(S.getMainOp()->operand_values(),
+                          IsaPred<Instruction>);
+          unsigned LastOpcode = cast<Instruction>(LastVal)->getOpcode();
+          return none_of(S.getMainOp()->operand_values(), [&](Value *Op) {
+            auto *I = dyn_cast<Instruction>(Op);
+            return I && I->getOpcode() == LastOpcode;
+          });
+        };
+        if (ReduxWidth == ReductionLimit) {
+          AllowNoPowerOf2 = true;
+        } else if (ReduxWidth == SmallReductionNonPowerOf2 && TwoGroupsOnly &&
+                   LastOfTwoGroupsIsSingle && S &&
+                   S.areInstructionsWithCopyableElements() &&
+                   LoneValueMismatchesMainOpOperands()) {
+          AllowNoPowerOf2 = false;
+        } else if (S && !S.isAltShuffle()) {
+          AllowNoPowerOf2 = true;
+        } else {
+          InstructionsState OpS =
+              getSameOpcode(ArrayRef(Candidates).slice(FullRegReduxWidth), TLI);
+          if (!OpS || OpS.isAltShuffle())
+            AllowNoPowerOf2 = true;
+        }
+      }
+      if (!AllowNoPowerOf2)
+        ReduxWidth = FullRegReduxWidth;
       ReduxWidth = std::min(ReduxWidth, MaxElts);
 
       unsigned Start = 0;
@@ -29789,7 +29883,10 @@ bool SLPVectorizerPass::tryToVectorize(Instruction *I, BoUpSLP &R) {
   auto *Op0 = dyn_cast<Instruction>(I->getOperand(0));
   auto *Op1 = dyn_cast<Instruction>(I->getOperand(1));
   if (!Op0 || !Op1 || Op0->getParent() != P || Op1->getParent() != P ||
-      R.isDeleted(Op0) || R.isDeleted(Op1))
+      R.isDeleted(Op0) || R.isDeleted(Op1) ||
+      ((Op0 == Op1 || isa<LoadInst, ExtractValueInst>(Op0) ||
+        isa<LoadInst, ExtractValueInst>(Op1)) &&
+       SLPCostThreshold >= 0))
     return false;
 
   // First collect all possible candidates
