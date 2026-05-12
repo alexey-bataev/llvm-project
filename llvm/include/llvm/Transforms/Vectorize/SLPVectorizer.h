@@ -57,7 +57,7 @@ class BoUpSLP;
 
 struct SLPVectorizerPass : public PassInfoMixin<SLPVectorizerPass> {
   using StoreList = SmallVector<StoreInst *, 8>;
-  using StoreListMap = MapVector<Value *, StoreList>;
+  using StoreListMap = SmallMapVector<Value *, StoreList, 8>;
   using GEPList = SmallVector<GetElementPtrInst *, 8>;
   using GEPListMap = MapVector<Value *, GEPList>;
   using InstSetVector = SmallSetVector<Instruction *, 8>;
