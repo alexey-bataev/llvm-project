@@ -264,6 +264,11 @@ static cl::opt<bool> VectorizePoorThroughput(
     cl::desc("Use poor-throughput instructions (e.g. fdiv, frem, fsqrt) as "
              "standalone vectorization seeds."));
 
+static cl::opt<bool> VectorizeOnceUsed(
+    "slp-vectorize-once-used", cl::init(true), cl::Hidden,
+    cl::desc("Use instructions with the single user as standalone "
+             "vectorization seeds."));
+
 /// True when \p slp-vectorize-non-power-of-2 is enabled and \p NumElts is a
 /// supported non-power-of-2 width: \p NumElts + 1 must be a power of two
 /// (e.g. 3 or 7 lanes, i.e. almost a full power-of-2 register).
@@ -10120,11 +10125,6 @@ struct SeedGroupKey {
   Intrinsic::ID IntrID = Intrinsic::not_intrinsic;
   StringRef CalleeName;
 
-  bool operator==(const SeedGroupKey &O) const {
-    return Opcode == O.Opcode && IntrID == O.IntrID &&
-           CalleeName == O.CalleeName;
-  }
-  bool operator!=(const SeedGroupKey &O) const { return !(*this == O); }
   bool less(const SeedGroupKey &O) const {
     if (Opcode != O.Opcode)
       return Opcode < O.Opcode;
@@ -10146,6 +10146,22 @@ static SeedGroupKey getSeedGroupKey(const Instruction *I,
   return K;
 }
 } // namespace
+
+/// Returns true if \p I is a part of a single-use chain, indexing a constant
+/// table: such an access is a gather, so the index itself is not worth
+/// vectorizing.
+static bool isConstantTableIndex(const Instruction *I) {
+  constexpr unsigned MaxIndexChainLength = 3;
+  const User *U = I->user_back();
+  for (unsigned Cnt = 0; Cnt < MaxIndexChainLength; ++Cnt) {
+    if (const auto *GEP = dyn_cast<GetElementPtrInst>(U))
+      return isa<Constant>(GEP->getPointerOperand());
+    if (!isa<Instruction>(U) || !U->hasOneUse())
+      return false;
+    U = *U->user_begin();
+  }
+  return false;
+}
 
 /// Returns true if \p I is an expensive scalar op whose vector form is cheaper
 /// per lane (e.g. fdiv, frem, fsqrt).
@@ -28011,6 +28027,24 @@ SLPVectorizerPass::vectorizeStoreChainImpl(ArrayRef<Value *> Chain, BoUpSLP &R,
       Size = (!IsAllowedSize && S) ? 1 : 2;
       return false;
     }
+    // Every value is reused several times outside of the chain: such a chain
+    // only merges the stores, while the scalars remain live for the other users
+    // and all the lanes are gathered back. A single outside use may still be a
+    // part of the larger vectorizable graph, same for the values, fed by the
+    // loads, where the vector loads may pay off the gathering.
+    if (S && S.getOpcode() != Instruction::Load &&
+        none_of(ValOps.getArrayRef(),
+                [](Value *V) {
+                  return any_of(cast<Instruction>(V)->operand_values(),
+                                IsaPred<LoadInst>);
+                }) &&
+        all_of(ValOps.getArrayRef(), [&](Value *V) {
+          return count_if(V->users(),
+                          [&](User *U) { return !Stores.contains(U); }) > 1;
+        })) {
+      Size = 1;
+      return false;
+    }
   }
   R.buildTree(Chain);
   // Check if tree tiny and store itself or its value is not vectorized.
@@ -28934,7 +28968,8 @@ void SLPVectorizerPass::collectSeedInstructions(BasicBlock *BB) {
 
 bool SLPVectorizerPass::tryToVectorizeList(ArrayRef<Value *> VL, BoUpSLP &R,
                                            bool MaxVFOnly,
-                                           bool LimitToRegisterVF) {
+                                           bool LimitToRegisterVF,
+                                           bool NonOverlapping) {
   if (VL.size() < 2)
     return false;
 
@@ -28974,7 +29009,7 @@ bool SLPVectorizerPass::tryToVectorizeList(ArrayRef<Value *> VL, BoUpSLP &R,
   unsigned MaxVF = std::max<unsigned>(
       getFloorFullVectorNumberOfElements(*TTI, ScalarTy, VL.size()), MinVF);
   MaxVF = std::min(R.getMaximumVF(Sz, S.getOpcode()), MaxVF);
-  // Standalone poor-throughput seeds only need one register worth of lanes.
+  // Standalone seeds only need one register worth of lanes.
   if (LimitToRegisterVF && Sz != 0)
     MaxVF = std::min(MaxVF, std::max(MinVF, R.getMaxVecRegSize() / Sz));
   if (MaxVF < 2) {
@@ -29031,8 +29066,11 @@ bool SLPVectorizerPass::tryToVectorizeList(ArrayRef<Value *> VL, BoUpSLP &R,
                         << "\n");
 
       R.buildTree(Ops);
-      if (R.isTreeTinyAndNotFullyVectorizable())
+      if (R.isTreeTinyAndNotFullyVectorizable()) {
+        if (NonOverlapping)
+          I += ActualVF - 1;
         continue;
+      }
       if (R.isProfitableToReorder()) {
         R.reorderTopToBottom();
         R.reorderBottomToTop(
@@ -29052,16 +29090,18 @@ bool SLPVectorizerPass::tryToVectorizeList(ArrayRef<Value *> VL, BoUpSLP &R,
       if (Cost < -SLPCostThreshold) {
         LLVM_DEBUG(dbgs() << "SLP: Vectorizing list at cost:" << Cost << ".\n");
         R.getORE()->emit(OptimizationRemark(SV_NAME, "VectorizedList",
-                                                    cast<Instruction>(Ops[0]))
-                                 << "SLP vectorized with cost " << ore::NV("Cost", Cost)
-                                 << " and with tree size "
-                                 << ore::NV("TreeSize", R.getTreeSize()));
+                                            cast<Instruction>(Ops[0]))
+                         << "SLP vectorized with cost " << ore::NV("Cost", Cost)
+                         << " and with tree size "
+                         << ore::NV("TreeSize", R.getTreeSize()));
 
         R.vectorizeTree();
         // Move to the next bundle.
         I += VF - 1;
         NextInst = I + 1;
         Changed = true;
+      } else if (NonOverlapping) {
+        I += ActualVF - 1;
       }
     }
   }
@@ -29070,8 +29110,8 @@ bool SLPVectorizerPass::tryToVectorizeList(ArrayRef<Value *> VL, BoUpSLP &R,
     R.getORE()->emit([&]() {
       return OptimizationRemarkMissed(SV_NAME, "NotBeneficial", I0)
              << "List vectorization was possible but not beneficial with cost "
-             << ore::NV("Cost", MinCost) << " >= "
-             << ore::NV("Treshold", -SLPCostThreshold);
+             << ore::NV("Cost", MinCost)
+             << " >= " << ore::NV("Treshold", -SLPCostThreshold);
     });
   } else if (!Changed) {
     R.getORE()->emit([&]() {
@@ -32889,6 +32929,7 @@ bool SLPVectorizerPass::vectorizeChainsInBlock(BasicBlock *BB, BoUpSLP &R) {
   SmallSetVector<Instruction *, 8> FMACandidates;
   SmallSetVector<Instruction *, 8> PoorThroughputSeeds;
   PoorThroughputOpCache PoorThroughputCache;
+  SmallSetVector<Instruction *, 8> OnceUsedSeeds;
   auto VectorizeInsertsAndCmps = [&](bool AtTerminator) {
     bool Changed = vectorizeInserts(PostProcessInserts, BB, R, FMACandidates);
     if (AtTerminator) {
@@ -33039,6 +33080,22 @@ bool SLPVectorizerPass::vectorizeChainsInBlock(BasicBlock *BB, BoUpSLP &R) {
     else if (VectorizePoorThroughput &&
              isPoorThroughputOp(&*It, *TTI, *TLI, PoorThroughputCache))
       PoorThroughputSeeds.insert(&*It);
+    // Only the opcodes, forming a vectorizable bundle on their own, are used as
+    // standalone seeds. Loads and addresses are excluded: their tree is built
+    // without the users, so it does not pay off the extracts. A cast, feeding
+    // a multi-used cast, is excluded for the same reason: such a user stays
+    // scalar, so every lane of the seed is extracted back. The fp-to-int
+    // conversions are excluded too: the result is moved to the other register
+    // domain, so the extracts are paid on top of the repacking. The indices of
+    // the constant tables are excluded as well, such accesses are gathers.
+    else if (VectorizeOnceUsed && It->hasOneUse() &&
+             !isConstantTableIndex(&*It) &&
+             (isa<BinaryOperator, UnaryOperator, SelectInst, FreezeInst,
+                  CallInst, ExtractElementInst>(It) ||
+              (isa<CastInst>(It) && !isa<FPToSIInst, FPToUIInst>(It) &&
+               (!isa<CastInst>(It->user_back()) ||
+                It->user_back()->hasOneUse()))))
+      OnceUsedSeeds.insert(&*It);
   }
 
   // Late post-process: run operand-chain vectorization for stores.
@@ -33091,6 +33148,61 @@ bool SLPVectorizerPass::vectorizeChainsInBlock(BasicBlock *BB, BoUpSLP &R) {
   assert(Empty.empty() &&
          "No new FMA candidates expected during AllowFMACandidates retry.");
 
+  // Vectorizes the standalone seeds in the groups of the compatible
+  // instructions.
+  auto VectorizeSeeds = [&](SmallVectorImpl<Value *> &Seeds,
+                            function_ref<bool(Value *, Value *)> IsLessGroup) {
+    if (Seeds.size() < 2)
+      return false;
+    auto SeedSorter = [&](Value *V1, Value *V2) {
+      if (V1 == V2)
+        return false;
+      auto *I1 = cast<Instruction>(V1);
+      auto *I2 = cast<Instruction>(V2);
+      Type *T1 = I1->getType();
+      Type *T2 = I2->getType();
+      if (T1->getTypeID() != T2->getTypeID())
+        return T1->getTypeID() < T2->getTypeID();
+      if (T1->getScalarSizeInBits() != T2->getScalarSizeInBits())
+        return T1->getScalarSizeInBits() < T2->getScalarSizeInBits();
+      if (IsLessGroup(V1, V2))
+        return true;
+      if (IsLessGroup(V2, V1))
+        return false;
+      return I1->comesBefore(I2);
+    };
+    auto AreCompatibleSeeds = [&](ArrayRef<Value *> VL, Value *V) {
+      if (VL.empty() || VL.back() == V)
+        return true;
+      return cast<Instruction>(VL.back())->getType() ==
+                 cast<Instruction>(V)->getType() &&
+             !IsLessGroup(VL.back(), V) && !IsLessGroup(V, VL.back());
+    };
+    return tryToVectorizeSequence<Value>(
+        Seeds, SeedSorter, AreCompatibleSeeds,
+        [this, &R](ArrayRef<Value *> Candidates, bool MaxVFOnly) {
+          // Lanes of a vector instruction cannot depend on each other, so a
+          // chain of the dependent seeds has no vectorizable window at all.
+          if (all_of(enumerate(Candidates.drop_front()), [&](const auto &P) {
+                auto *I = dyn_cast<Instruction>(P.value());
+                return I &&
+                       is_contained(I->operand_values(), Candidates[P.index()]);
+              }))
+            return false;
+          // The same list may be retried for the different groups of the same
+          // type, the earlier rejection is still valid for the block.
+          if (R.areAnalyzedReductionVals(Candidates))
+            return false;
+          if (tryToVectorizeList(Candidates, R, MaxVFOnly,
+                                 /*LimitToRegisterVF=*/true,
+                                 /*NonOverlapping=*/true))
+            return true;
+          R.analyzedReductionVals(Candidates);
+          return false;
+        },
+        /*MaxVFOnly=*/false, R);
+  };
+
   if (PoorThroughputSeeds.size() >= 2) {
     SmallVector<Value *> Seeds;
     SmallDenseMap<Value *, SeedGroupKey> SeedKeys;
@@ -33108,38 +33220,42 @@ bool SLPVectorizerPass::vectorizeChainsInBlock(BasicBlock *BB, BoUpSLP &R) {
       SeedKeys.try_emplace(I, getSeedGroupKey(I, *TLI));
       Seeds.push_back(I);
     }
-    auto SeedSorter = [&](Value *V1, Value *V2) {
-      if (V1 == V2)
-        return false;
-      auto *I1 = cast<Instruction>(V1);
-      auto *I2 = cast<Instruction>(V2);
-      Type *T1 = I1->getType();
-      Type *T2 = I2->getType();
-      if (T1->getTypeID() != T2->getTypeID())
-        return T1->getTypeID() < T2->getTypeID();
-      if (T1->getScalarSizeInBits() != T2->getScalarSizeInBits())
-        return T1->getScalarSizeInBits() < T2->getScalarSizeInBits();
-      const SeedGroupKey &K1 = SeedKeys.at(V1);
-      const SeedGroupKey &K2 = SeedKeys.at(V2);
-      if (K1 != K2)
-        return K1.less(K2);
-      return I1->comesBefore(I2);
+    Changed |= VectorizeSeeds(Seeds, [&](Value *V1, Value *V2) {
+      return SeedKeys.at(V1).less(SeedKeys.at(V2));
+    });
+  }
+
+  // Instructions with the single user require just one extract per lane, so
+  // they are used as the seeds for the very last attempt, after all other
+  // roots are exhausted.
+  if (OnceUsedSeeds.size() >= 2) {
+    // Loads are not seeds, their subkeys do not affect the grouping.
+    auto GenerateLoadsSubkey = [](size_t, LoadInst *LI) {
+      return hash_value(LI->getPointerOperand());
     };
-    auto AreCompatibleSeeds = [&](ArrayRef<Value *> VL, Value *V) {
-      if (VL.empty() || VL.back() == V)
-        return true;
-      return cast<Instruction>(VL.back())->getType() ==
-                 cast<Instruction>(V)->getType() &&
-             SeedKeys.at(VL.back()) == SeedKeys.at(V);
-    };
-    if (Seeds.size() >= 2)
-      Changed |= tryToVectorizeSequence<Value>(
-          Seeds, SeedSorter, AreCompatibleSeeds,
-          [this, &R](ArrayRef<Value *> Candidates, bool MaxVFOnly) {
-            return tryToVectorizeList(Candidates, R, MaxVFOnly,
-                                      /*LimitToRegisterVF=*/true);
-          },
-          /*MaxVFOnly=*/false, R);
+    SmallVector<Value *> Seeds;
+    SmallDenseMap<std::pair<size_t, size_t>, unsigned> KeyToGroup;
+    SmallDenseMap<Value *, unsigned> SeedGroups;
+    for (Instruction *I : OnceUsedSeeds) {
+      if (R.isDeleted(I) || !I->hasOneUse() || R.isAnalyzedReductionRoot(I) ||
+          !isValidElementType(getValueType(I)))
+        continue;
+      // The role of the seed is already decided, if its user is resolved.
+      auto *UI = dyn_cast<Instruction>(I->user_back());
+      if (UI && (R.isDeleted(UI) || R.isVectorized(UI)))
+        continue;
+      // The keys are hashes, so the groups are numbered by the first seed to
+      // keep the order deterministic.
+      std::pair<size_t, size_t> Key =
+          generateKeySubkey(I, TLI, GenerateLoadsSubkey,
+                            /*AllowAlternate=*/false);
+      SeedGroups.try_emplace(
+          I, KeyToGroup.try_emplace(Key, KeyToGroup.size()).first->second);
+      Seeds.push_back(I);
+    }
+    Changed |= VectorizeSeeds(Seeds, [&](Value *V1, Value *V2) {
+      return SeedGroups.at(V1) < SeedGroups.at(V2);
+    });
   }
 
   return Changed;
