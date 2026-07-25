@@ -6,7 +6,7 @@ define void @test() {
 ; CHECK-NEXT:  [[BB:.*]]:
 ; CHECK-NEXT:    br label %[[BB1:.*]]
 ; CHECK:       [[BB1]]:
-; CHECK-NEXT:    [[TMP0:%.*]] = phi <4 x i32> [ <i32 poison, i32 poison, i32 0, i32 0>, %[[BB]] ], [ [[TMP6:%.*]], %[[BB14:.*]] ], [ <i32 poison, i32 poison, i32 0, i32 0>, %[[BB10:.*]] ]
+; CHECK-NEXT:    [[TMP0:%.*]] = phi <4 x i32> [ <i32 poison, i32 poison, i32 0, i32 0>, %[[BB]] ], [ [[TMP11:%.*]], %[[BB14:.*]] ], [ <i32 poison, i32 poison, i32 0, i32 0>, %[[BB10:.*]] ]
 ; CHECK-NEXT:    br label %[[BB3:.*]]
 ; CHECK:       [[BB3]]:
 ; CHECK-NEXT:    [[TMP1:%.*]] = phi <2 x float> [ zeroinitializer, %[[BB1]] ]
@@ -20,11 +20,16 @@ define void @test() {
 ; CHECK-NEXT:      i32 0, label %[[BB1]]
 ; CHECK-NEXT:    ]
 ; CHECK:       [[BB14]]:
-; CHECK-NEXT:    [[OR:%.*]] = or i32 [[PHI13]], [[PHI11]]
+; CHECK-NEXT:    [[TMP3:%.*]] = insertelement <2 x i32> poison, i32 [[PHI11]], i64 0
+; CHECK-NEXT:    [[TMP4:%.*]] = shufflevector <2 x i32> [[TMP3]], <2 x i32> poison, <2 x i32> zeroinitializer
+; CHECK-NEXT:    [[TMP5:%.*]] = insertelement <2 x i32> <i32 poison, i32 0>, i32 [[PHI13]], i64 0
+; CHECK-NEXT:    [[TMP6:%.*]] = or <2 x i32> [[TMP4]], [[TMP5]]
+; CHECK-NEXT:    [[OR:%.*]] = extractelement <2 x i32> [[TMP6]], i64 0
 ; CHECK-NEXT:    [[OR15]] = or i32 [[OR]], 0
-; CHECK-NEXT:    [[TMP3:%.*]] = insertelement <4 x i32> poison, i32 [[PHI11]], i64 2
-; CHECK-NEXT:    [[TMP5:%.*]] = insertelement <4 x i32> [[TMP3]], i32 [[OR]], i64 3
-; CHECK-NEXT:    [[TMP6]] = or <4 x i32> [[TMP5]], <i32 poison, i32 poison, i32 0, i32 0>
+; CHECK-NEXT:    [[TMP8:%.*]] = shufflevector <2 x i32> [[TMP6]], <2 x i32> poison, <4 x i32> <i32 0, i32 1, i32 poison, i32 1>
+; CHECK-NEXT:    [[TMP9:%.*]] = insertelement <4 x i32> poison, i32 [[OR15]], i64 0
+; CHECK-NEXT:    [[TMP10:%.*]] = shufflevector <4 x i32> [[TMP9]], <4 x i32> poison, <4 x i32> <i32 poison, i32 poison, i32 0, i32 poison>
+; CHECK-NEXT:    [[TMP11]] = shufflevector <4 x i32> [[TMP8]], <4 x i32> [[TMP10]], <4 x i32> <i32 poison, i32 poison, i32 6, i32 1>
 ; CHECK-NEXT:    br i1 false, label %[[BB1]], label %[[BB10]]
 ;
 bb:

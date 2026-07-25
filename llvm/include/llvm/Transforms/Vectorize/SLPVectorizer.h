@@ -94,10 +94,13 @@ private:
 
   /// Try to vectorize a list of operands.
   /// \param MaxVFOnly Vectorize only using maximal allowed register size.
+  /// \param NonOverlapping Do not retry the windows of \p VL, overlapping with
+  /// the already rejected ones.
   /// \returns true if a value was vectorized.
   bool tryToVectorizeList(ArrayRef<Value *> VL, slpvectorizer::BoUpSLP &R,
                           bool MaxVFOnly = false,
-                          bool LimitToRegisterVF = false);
+                          bool LimitToRegisterVF = false,
+                          bool NonOverlapping = false);
 
   /// Try to vectorize a chain that may start at the operands of \p I.
   bool tryToVectorize(Instruction *I, slpvectorizer::BoUpSLP &R,

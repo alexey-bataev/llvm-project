@@ -18,12 +18,12 @@ define i16 @foo(i16 %in1, i16 %in2) {
 ; CHECK-NEXT:    [[ZEXT2_2:%.*]] = zext i16 [[IN2]] to i64
 ; CHECK-NEXT:    [[TMP13:%.*]] = mul nuw nsw i64 [[ZEXT2_2]], [[ZEXT1_2]]
 ; CHECK-NEXT:    [[AND2:%.*]] = and i64 [[TMP13]], 65535
-; CHECK-NEXT:    [[TMP11:%.*]] = icmp ne i64 [[AND2]], 65533
-; CHECK-NEXT:    [[ZEXT3_2:%.*]] = zext i1 [[TMP11]] to i16
-; CHECK-NEXT:    [[CMP2_2:%.*]] = icmp ne i64 [[TMP13]], 196605
+; CHECK-NEXT:    [[CMP2_2:%.*]] = icmp ne i64 [[AND2]], 65533
 ; CHECK-NEXT:    [[ZEXT4_2:%.*]] = zext i1 [[CMP2_2]] to i16
-; CHECK-NEXT:    [[ADD2:%.*]] = add nuw nsw i16 [[ADD1]], [[ZEXT4_2]]
-; CHECK-NEXT:    [[ADD3:%.*]] = add nuw nsw i16 [[ADD2]], [[ZEXT3_2]]
+; CHECK-NEXT:    [[TMP6:%.*]] = icmp ne i64 [[TMP13]], 196605
+; CHECK-NEXT:    [[ZEXT3_2:%.*]] = zext i1 [[TMP6]] to i16
+; CHECK-NEXT:    [[ADD2:%.*]] = add nuw nsw i16 [[ADD1]], [[ZEXT3_2]]
+; CHECK-NEXT:    [[ADD3:%.*]] = add nuw nsw i16 [[ADD2]], [[ZEXT4_2]]
 ; CHECK-NEXT:    ret i16 [[ADD3]]
 ;
 entry:
