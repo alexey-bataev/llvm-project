@@ -11,15 +11,17 @@ define i32 @test(i128 %add134.i8203) {
 ; CHECK:       [[CONT90_I]]:
 ; CHECK-NEXT:    [[T_I_SROA_488_2:%.*]] = phi i64 [ [[SUB9_I3318]], %[[ENTRY]] ]
 ; CHECK-NEXT:    [[T_I_SROA_488_1:%.*]] = phi i64 [ 0, %[[ENTRY]] ]
-; CHECK-NEXT:    [[T_I_SROA_457_1:%.*]] = phi i64 [ 0, %[[ENTRY]] ]
-; CHECK-NEXT:    [[CONV66_I8295:%.*]] = zext i64 [[T_I_SROA_457_1]] to i128
+; CHECK-NEXT:    [[TMP9:%.*]] = phi <2 x i64> [ zeroinitializer, %[[ENTRY]] ]
+; CHECK-NEXT:    [[TMP10:%.*]] = trunc <2 x i64> [[TMP9]] to <2 x i1>
 ; CHECK-NEXT:    [[CONV76_I8298:%.*]] = zext i64 [[T_I_SROA_488_1]] to i128
-; CHECK-NEXT:    [[MUL127_I8312:%.*]] = mul i128 0, [[CONV76_I8298]]
-; CHECK-NEXT:    [[MUL132_I8313:%.*]] = mul i128 0, [[CONV66_I8295]]
-; CHECK-NEXT:    [[ADD135_I8317:%.*]] = or i128 0, [[MUL132_I8313]]
+; CHECK-NEXT:    [[TMP11:%.*]] = mul <2 x i1> zeroinitializer, [[TMP10]]
+; CHECK-NEXT:    [[TMP12:%.*]] = or <2 x i1> zeroinitializer, [[TMP11]]
+; CHECK-NEXT:    [[TMP13:%.*]] = extractelement <2 x i1> [[TMP12]], i64 0
+; CHECK-NEXT:    [[ADD135_I8317:%.*]] = zext i1 [[TMP13]] to i128
 ; CHECK-NEXT:    [[TMP0:%.*]] = trunc i128 [[ADD135_I8317]] to i64
 ; CHECK-NEXT:    [[CONV137_I8321:%.*]] = and i64 [[TMP0]], 0
-; CHECK-NEXT:    [[ADD153_I8337:%.*]] = or i128 0, [[MUL127_I8312]]
+; CHECK-NEXT:    [[TMP14:%.*]] = extractelement <2 x i1> [[TMP12]], i64 1
+; CHECK-NEXT:    [[ADD153_I8337:%.*]] = zext i1 [[TMP14]] to i128
 ; CHECK-NEXT:    [[ADD155_I8339:%.*]] = or i128 [[ADD153_I8337]], 0
 ; CHECK-NEXT:    [[TMP1:%.*]] = trunc i128 [[ADD155_I8339]] to i64
 ; CHECK-NEXT:    [[CONV76_I8299:%.*]] = zext i64 [[T_I_SROA_488_2]] to i128

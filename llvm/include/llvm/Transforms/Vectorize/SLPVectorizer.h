@@ -94,10 +94,12 @@ private:
 
   /// Try to vectorize a list of operands.
   /// \param MaxVFOnly Vectorize only using maximal allowed register size.
+  /// \param StandaloneSeeds \p VL are the standalone seeds: the vector factor
+  /// is limited by a single register and the windows, overlapping with the
+  /// rejected ones, are not retried.
   /// \returns true if a value was vectorized.
   bool tryToVectorizeList(ArrayRef<Value *> VL, slpvectorizer::BoUpSLP &R,
-                          bool MaxVFOnly = false,
-                          bool LimitToRegisterVF = false);
+                          bool MaxVFOnly = false, bool StandaloneSeeds = false);
 
   /// Try to vectorize a chain that may start at the operands of \p I.
   bool tryToVectorize(Instruction *I, slpvectorizer::BoUpSLP &R,
